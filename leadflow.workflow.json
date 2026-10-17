@@ -1,0 +1,305 @@
+{
+  "name": "LeadFlow: AI lead scoring and routing",
+  "nodes": [
+    {
+      "id": "1",
+      "name": "New lead (form webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "leadflow-intake"
+    },
+    {
+      "id": "2",
+      "name": "Normalize lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// n8n Code node: \"Normalize lead\". Cleans the raw form submission and adds simple enrichment.\nconst FREE_EMAIL = new Set(['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com', 'aol.com', 'proton.me', 'protonmail.com']);\n\nreturn $input.all().map((item) => {\n  const raw = item.json.body ?? item.json;\n  const clean = (v) => (typeof v === 'string' ? v.trim() : v ?? '');\n\n  const email = clean(raw.email).toLowerCase();\n  const domain = email.includes('@') ? email.split('@')[1] : '';\n  const [firstName, ...rest] = clean(raw.name).split(/\\s+/);\n  const employees = Number(String(raw.company_size ?? '').replace(/[^0-9]/g, '')) || null;\n\n  return {\n    json: {\n      submitted_at: new Date().toISOString(),\n      first_name: firstName || '',\n      last_name: rest.join(' '),\n      email,\n      email_valid: /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email),\n      company: clean(raw.company),\n      company_domain: domain,\n      business_email: Boolean(domain) && !FREE_EMAIL.has(domain),\n      company_size: employees,\n      budget: clean(raw.budget),\n      timeline: clean(raw.timeline),\n      message: clean(raw.message).slice(0, 2000),\n      source: clean(raw.source) || 'website',\n    },\n  };\n});\n"
+      }
+    },
+    {
+      "id": "3",
+      "name": "AI lead scoring (Claude)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "anthropic-beta",
+              "value": "server-side-fallback-2026-07-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'claude-opus-5-5', max_tokens: 2048, fallbacks: 'default', output_config: { effort: 'low', format: { type: 'json_schema', schema: {\"type\": \"object\", \"properties\": {\"score\": {\"type\": \"integer\", \"description\": \"0-100 lead quality score\"}, \"intent\": {\"type\": \"string\", \"enum\": [\"high\", \"medium\", \"low\", \"spam\"]}, \"summary\": {\"type\": \"string\", \"description\": \"One sentence on what the lead needs\"}, \"next_action\": {\"type\": \"string\", \"description\": \"Recommended next step for sales\"}}, \"required\": [\"score\", \"intent\", \"summary\", \"next_action\"], \"additionalProperties\": false} } }, system: \"You are a B2B sales qualification analyst. Score inbound leads from 0 to 100 for how likely they are to become a paying client of an AI automation and data engineering agency. Weigh budget, timeline, company size, business email and how specific the need is. Be strict: vague or spam-like leads score low.\", messages: [{ role: 'user', content: 'Score this lead:\\n' + JSON.stringify($json, null, 2) }] }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "id": "4",
+      "name": "Parse AI score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// n8n Code node: \"Parse AI score\". Reads Claude's structured JSON and merges it onto the lead.\n// Falls back to a rule-based score if the AI call failed, so no lead is ever dropped.\nconst leads = $('Normalize lead').all();\n\nfunction ruleScore(lead) {\n  let score = 20;\n  if (lead.business_email) score += 25;\n  if ((lead.company_size ?? 0) >= 50) score += 20;\n  if (/\\$?\\d/.test(lead.budget)) score += 15;\n  if (/week|month|asap|urgent|now/i.test(lead.timeline)) score += 10;\n  if ((lead.message ?? '').length > 80) score += 10;\n  return Math.min(score, 100);\n}\n\nreturn $input.all().map((item, i) => {\n  const lead = leads[i]?.json ?? {};\n  const res = item.json;\n  let ai = null;\n\n  if (res?.stop_reason !== 'refusal' && Array.isArray(res?.content)) {\n    const text = res.content.find((b) => b.type === 'text')?.text;\n    try { ai = text ? JSON.parse(text) : null; } catch { ai = null; }\n  }\n\n  const score = ai ? Math.max(0, Math.min(100, Math.round(ai.score))) : ruleScore(lead);\n  return {\n    json: {\n      ...lead,\n      score,\n      tier: score >= 70 ? 'hot' : score >= 40 ? 'warm' : 'cold',\n      intent: ai?.intent ?? 'unknown',\n      summary: ai?.summary ?? 'Scored with fallback rules (AI unavailable).',\n      next_action: ai?.next_action ?? 'Review manually',\n      scored_by: ai ? 'claude' : 'rules',\n    },\n  };\n});\n"
+      }
+    },
+    {
+      "id": "5",
+      "name": "Hot lead? (score >= 70)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "hot",
+              "leftValue": "={{ $json.score }}",
+              "rightValue": 70,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "6",
+      "name": "Alert sales in Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        1220,
+        160
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "#sales-hot-leads"
+        },
+        "text": "=:fire: *Hot lead ({{ $json.score }}/100)*: {{ $json.first_name }} {{ $json.last_name }} at {{ $json.company || $json.company_domain }}\n{{ $json.summary }}\n*Next step:* {{ $json.next_action }}\n{{ $json.email }}",
+        "otherOptions": {}
+      }
+    },
+    {
+      "id": "7",
+      "name": "Add to CRM sheet (Hot leads)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1220,
+        340
+      ],
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "url",
+          "value": "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Hot leads"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {}
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "8",
+      "name": "Add to nurture list",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1220,
+        520
+      ],
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "url",
+          "value": "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Nurture"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {}
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "9",
+      "name": "Reply to form",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1480,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, message: 'Thanks! We will be in touch shortly.' }) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "New lead (form webhook)": {
+      "main": [
+        [
+          {
+            "node": "Normalize lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize lead": {
+      "main": [
+        [
+          {
+            "node": "AI lead scoring (Claude)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI lead scoring (Claude)": {
+      "main": [
+        [
+          {
+            "node": "Parse AI score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI score": {
+      "main": [
+        [
+          {
+            "node": "Hot lead? (score >= 70)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hot lead? (score >= 70)": {
+      "main": [
+        [
+          {
+            "node": "Alert sales in Slack",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Add to CRM sheet (Hot leads)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Add to nurture list",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add to CRM sheet (Hot leads)": {
+      "main": [
+        [
+          {
+            "node": "Reply to form",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add to nurture list": {
+      "main": [
+        [
+          {
+            "node": "Reply to form",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
